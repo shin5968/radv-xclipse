@@ -1,0 +1,2054 @@
+diff --git a/README.md b/README.md
+index e54f010..94b1d85 100644
+--- a/README.md
++++ b/README.md
+@@ -102,6 +102,10 @@ display), then run Vulkan apps with `WAYLAND_DISPLAY` set to its socket.
+ 
+ ### Presentation
+ 
++An optional glibc AHardwareBuffer bridge and Termux-X11 AHB socket presentation
++path are available; see [AHB setup, synchronization and tests](docs/xclipse-ahb.md).
++
++
+ - X servers with DRI3, such as Termux:X11: the GPU renders into a buffer the X server reads
+   directly.
+ - X servers without DRI3 (VNC and similar), and Wayland compositors without linux-dmabuf (most
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index bac7dd2..f75c226 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -35,6 +35,7 @@ Text: `LICENSES/Apache-2.0.txt`
+ - `include/GLES2/gl2platform.h`
+ - `include/GLES3/gl3platform.h`
+ - `include/vulkan/vk_android_native_buffer.h`
++- `src/util/xclipse_ahb.h` (NDK ABI declarations)
+ 
+ ## Apache-2.0 OR MIT
+ 
+diff --git a/build.sh b/build.sh
+index 7c299f7..79c95b8 100755
+--- a/build.sh
++++ b/build.sh
+@@ -32,7 +32,7 @@ BUILD="${BUILD_DIR:-build-glibc}"
+ 
+ if [ ! -f "$BUILD/build.ninja" ]; then
+    set -- -Dbuildtype=release -Db_ndebug=true -Dprefix=/usr \
+-      -Dplatforms=x11,wayland -Dvulkan-drivers=amd -Dgallium-drivers= -Dvulkan-layers= -Dtools= \
++      -Dxclipse-ahb=true -Dplatforms=x11,wayland -Dvulkan-drivers=amd -Dgallium-drivers= -Dvulkan-layers= -Dtools= \
+       -Dllvm=disabled -Dzstd=disabled -Dlmsensors=disabled -Dperfetto=false -Dvalgrind=disabled \
+       -Dlibunwind=disabled -Dxmlconfig=enabled \
+       -Dglx=disabled -Dgbm=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+diff --git a/linux/NOTICE.txt b/linux/NOTICE.txt
+index e99c7b0..dcc0b9a 100644
+--- a/linux/NOTICE.txt
++++ b/linux/NOTICE.txt
+@@ -45,6 +45,10 @@ BLAKE3 1.8.2 (src/util/blake3)
+    License: CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception (distributed here under
+    Apache-2.0)
+ 
++Android AHardwareBuffer ABI declarations (src/util/xclipse_ahb.h, optional glibc bridge)
++   Copyright 2017 The Android Open Source Project
++   License: Apache-2.0
++
+ C11 threads and time emulation (src/c11)
+    (C) Copyright yohhoy 2012.
+    Copyright 2022 Yonggang Luo
+diff --git a/linux/README.txt b/linux/README.txt
+index 7865699..4d60184 100644
+--- a/linux/README.txt
++++ b/linux/README.txt
+@@ -46,3 +46,10 @@ case. RADV_XCLIPSE_LOG=1 prints the [BUILD] line and the diagnostic markers to s
+ RADV_XCLIPSE_LOG=2 adds the verbose trace.
+ 
+ Licenses: see NOTICE.txt. The driver is MIT licensed (Mesa).
++
++Optional Termux-X11 AHardwareBuffer path
++--------------------------------------
++A glibc-compatible AHB bridge is required. Read AHB.md for its API contract.
++Set RADV_AHB_LIBRARY to its shared library and RADV_TERMUX_X11_AHB=1 to opt in.
++Without a compatible bridge the ordinary Linux presentation paths remain active.
++Legacy servers retain a render-completion wait; the AHB handle carries no fence.
+diff --git a/linux/package.sh b/linux/package.sh
+index 5422062..a6bfde2 100755
+--- a/linux/package.sh
++++ b/linux/package.sh
+@@ -39,6 +39,7 @@ cat > "$STAGE/radeon_xclipse_icd.aarch64.json" <<EOF
+ }
+ EOF
+ cp "$ROOT/linux/install.sh" "$ROOT/linux/README.txt" "$ROOT/linux/NOTICE.txt" "$STAGE/"
++cp "$ROOT/docs/xclipse-ahb.md" "$STAGE/AHB.md"
+ chmod 755 "$STAGE/install.sh"
+ rm -f "$OUT/$NAME.zip"
+ (cd "$OUT" && python3 -m zipfile -c "$NAME.zip" "$NAME")
+diff --git a/meson.build b/meson.build
+index 7dea3ea..aa88285 100644
+--- a/meson.build
++++ b/meson.build
+@@ -101,6 +101,18 @@ cpp_args = []
+ with_moltenvk_dir = get_option('moltenvk-dir')
+ with_vulkan_loader_rpath = get_option('vulkan-loader-rpath')
+ with_vulkan_icd_dir = get_option('vulkan-icd-dir')
++with_xclipse_ahb = get_option('xclipse-ahb')
++if with_xclipse_ahb
++  if host_machine.system() != 'linux'
++    error('xclipse-ahb requires glibc Linux')
++  endif
++  pre_args += ['-DHAVE_XCLIPSE_AHB', '-DVK_USE_PLATFORM_ANDROID_KHR', '-DANDROID_API_LEVEL=34']
++endif
++
++if get_option('xclipse-ahb-tests') and not with_xclipse_ahb
++  error('xclipse-ahb-tests requires xclipse-ahb')
++endif
++
+ with_tests = get_option('build-tests')
+ with_glcpp_tests = get_option('enable-glcpp-tests')
+ with_radv_tests = get_option('build-radv-tests')
+@@ -495,6 +507,9 @@ if _platforms.contains('auto')
+ endif
+ 
+ with_platform_android = _platforms.contains('android')
++if with_xclipse_ahb and with_platform_android
++  error('xclipse-ahb cannot be combined with the Android window system')
++endif
+ with_platform_x11 = _platforms.contains('x11')
+ with_platform_wayland = _platforms.contains('wayland')
+ with_platform_haiku = _platforms.contains('haiku')
+diff --git a/meson.options b/meson.options
+index be9c998..4ff1437 100644
+--- a/meson.options
++++ b/meson.options
+@@ -924,3 +924,6 @@ option(
+   value : true,
+   description : 'Build panfrost disassemblers. Explicitly setting this option to false will cause the panfrost stack to build without disassemblers. This should be left enabled for distro builds.'
+ )
++
++option('xclipse-ahb', type : 'boolean', value : false, description : 'Optional glibc AHardwareBuffer bridge for Xclipse and Termux-X11')
++option('xclipse-ahb-tests', type : 'boolean', value : false, description : 'Build standalone glibc AHB bridge tests')
+diff --git a/src/amd/vulkan/radv_android.c b/src/amd/vulkan/radv_android.c
+index 5a11077..e085c6a 100644
+--- a/src/amd/vulkan/radv_android.c
++++ b/src/amd/vulkan/radv_android.c
+@@ -20,11 +20,11 @@
+ #include <vulkan/vk_android_native_buffer.h>
+ 
+ #include <errno.h>
+-#include <unistd.h>
+ #endif /* DETECT_OS_ANDROID */
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/os_file.h"
++#include <unistd.h>
+ 
+ #include "vk_android.h"
+ #include "vk_format.h"
+@@ -542,13 +542,19 @@ radv_GetAndroidHardwareBufferPropertiesANDROID(VkDevice device_h, const struct A
+       vk_find_struct(pProperties->pNext, ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID);
+ 
+    /* Fill format properties of an Android hardware buffer. */
+-   if (format_prop)
+-      get_ahb_buffer_format_properties(device_h, buffer, format_prop);
++   if (format_prop) {
++      VkResult result = get_ahb_buffer_format_properties(device_h, buffer, format_prop);
++      if (result != VK_SUCCESS)
++         return result;
++   }
+ 
+    VkAndroidHardwareBufferFormatProperties2ANDROID *format_prop2 =
+       vk_find_struct(pProperties->pNext, ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID);
+-   if (format_prop2)
+-      get_ahb_buffer_format_properties2(device_h, buffer, format_prop2);
++   if (format_prop2) {
++      VkResult result = get_ahb_buffer_format_properties2(device_h, buffer, format_prop2);
++      if (result != VK_SUCCESS)
++         return result;
++   }
+ 
+    /* NOTE - We support buffers with only one handle but do not error on
+     * multiple handle case. Reason is that we want to support YUV formats
+@@ -560,10 +566,26 @@ radv_GetAndroidHardwareBufferPropertiesANDROID(VkDevice device_h, const struct A
+    if (dma_buf < 0)
+       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+ 
++#ifdef HAVE_XCLIPSE_AHB
++   AHardwareBuffer_Desc desc;
++   AHardwareBuffer_describe(buffer, &desc);
++   if (desc.layers != 1 || !desc.width || !desc.height)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   if (desc.format != AHARDWAREBUFFER_FORMAT_BLOB) {
++      uint64_t modifier, offset;
++      uint32_t pitch;
++      if (xclipse_ahb_layout(buffer, &modifier, &pitch, &offset))
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
++#endif
++
+    /* All memory types. */
+    uint32_t memory_types = (1u << pdev->memory_properties.memoryTypeCount) - 1;
+ 
+-   pProperties->allocationSize = lseek(dma_buf, 0, SEEK_END);
++   off_t size = lseek(dma_buf, 0, SEEK_END);
++   if (size <= 0)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   pProperties->allocationSize = size;
+    pProperties->memoryTypeBits = memory_types & ~pdev->memory_types_32bit;
+ 
+    return VK_SUCCESS;
+@@ -648,6 +670,13 @@ radv_import_ahb_memory(struct radv_device *device, struct radv_device_memory *me
+       if (result == VK_SUCCESS)
+          mod_info_p = &mod_info;
+ 
++#ifdef HAVE_XCLIPSE_AHB
++      if (result != VK_SUCCESS) {
++         radv_bo_destroy(device, NULL, mem->bo);
++         mem->bo = NULL;
++         return result;
++      }
++#endif
+       const uint64_t modifier = mod_info_p ? mod_info.drmFormatModifier : DRM_FORMAT_MOD_INVALID;
+       result = radv_image_init_layout(device, create_info, modifier, mod_info_p, NULL, mem->image);
+       if (result != VK_SUCCESS) {
+diff --git a/src/amd/vulkan/radv_android.h b/src/amd/vulkan/radv_android.h
+index 84939a3..246f1d3 100644
+--- a/src/amd/vulkan/radv_android.h
++++ b/src/amd/vulkan/radv_android.h
+@@ -27,9 +27,13 @@
+  * To actually enable the ext we also need
+  * the necessary kernel support.
+  */
+-#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26
++#if (DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 26) || defined(HAVE_XCLIPSE_AHB)
+ #define RADV_SUPPORT_ANDROID_HARDWARE_BUFFER 1
++#ifdef HAVE_XCLIPSE_AHB
++#include "util/xclipse_ahb.h"
++#else
+ #include <vndk/hardware_buffer.h>
++#endif
+ #else
+ #define RADV_SUPPORT_ANDROID_HARDWARE_BUFFER 0
+ #endif
+diff --git a/src/amd/vulkan/radv_formats.c b/src/amd/vulkan/radv_formats.c
+index c0af7ca..fc27d79 100644
+--- a/src/amd/vulkan/radv_formats.c
++++ b/src/amd/vulkan/radv_formats.c
+@@ -1381,6 +1381,7 @@ get_external_image_format_properties(struct radv_physical_device *pdev,
+          flags |= VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+ 
+       compat_flags = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
++      export_flags = (flags & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) ? compat_flags : 0;
+       break;
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+       flags = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+@@ -1493,6 +1494,17 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
+       }
+    }
+ 
++#ifdef HAVE_XCLIPSE_AHB
++   if (external_info && external_info->handleType ==
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) {
++      VkPhysicalDeviceImageFormatInfo2 ahb_info = *base_info;
++      ahb_info.format = format;
++      result = vk_android_get_ahb_image_properties(physicalDevice, &ahb_info, base_props);
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++#endif
++
+    if (ycbcr_props) {
+       ycbcr_props->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(format);
+    }
+@@ -1723,6 +1735,12 @@ radv_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
+    VkExternalMemoryFeatureFlagBits flags = 0;
+    VkExternalMemoryHandleTypeFlags export_flags = 0;
+    VkExternalMemoryHandleTypeFlags compat_flags = 0;
++   VK_FROM_HANDLE(radv_physical_device, pdev, physicalDevice);
++   if (pExternalBufferInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID &&
++       pdev->vk.supported_extensions.ANDROID_external_memory_android_hardware_buffer) {
++      vk_android_get_ahb_buffer_properties(physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
++      return;
++   }
+    switch (pExternalBufferInfo->handleType) {
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+diff --git a/src/amd/vulkan/radv_image.c b/src/amd/vulkan/radv_image.c
+index 7a5b153..96c7c04 100644
+--- a/src/amd/vulkan/radv_image.c
++++ b/src/amd/vulkan/radv_image.c
+@@ -1620,7 +1620,7 @@ radv_image_create(VkDevice _device, const struct radv_image_create_info *create_
+ 
+    if ((image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) ||
+        vk_image_is_android_native_buffer_alias(&image->vk)) {
+-#if DETECT_OS_ANDROID
++#if RADV_SUPPORT_ANDROID_HARDWARE_BUFFER
+       if (image->vk.external_handle_types & VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)
+          image->vk.ahb_format = radv_ahb_format_for_vk_format(image->vk.format);
+ #endif
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 18797fe..2d83c76 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -1277,8 +1277,14 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+       .AMD_shader_image_load_store_lod = true,
+       .AMD_shader_trinary_minmax = true,
+       .AMD_texture_gather_bias_lod = pdev->info.gfx_level < GFX11,
++#if RADV_SUPPORT_ANDROID_HARDWARE_BUFFER
++      .ANDROID_external_memory_android_hardware_buffer = RADV_SUPPORT_ANDROID_HARDWARE_BUFFER
++#ifdef HAVE_XCLIPSE_AHB
++         && pdev->info.pci_id == 0x73a0 && xclipse_ahb_available()
++#endif
++         ,
++#endif
+ #if DETECT_OS_ANDROID
+-      .ANDROID_external_memory_android_hardware_buffer = RADV_SUPPORT_ANDROID_HARDWARE_BUFFER,
+       .ANDROID_native_buffer = true,
+ #endif
+       .GOOGLE_decorate_string = true,
+diff --git a/src/amd/vulkan/radv_wsi.c b/src/amd/vulkan/radv_wsi.c
+index b6cec30..4142a37 100644
+--- a/src/amd/vulkan/radv_wsi.c
++++ b/src/amd/vulkan/radv_wsi.c
+@@ -117,6 +117,10 @@ radv_init_wsi(struct radv_physical_device *pdev)
+     * presentation at all. MESA_VK_WSI_DEBUG=sw still forces CPU images everywhere. */
+    if (pdev->info.pci_id == 0x73a0) {
+       pdev->wsi_device.x11_sw_fallback = true;
++#ifdef HAVE_XCLIPSE_AHB
++      pdev->wsi_device.x11_ahb =
++         pdev->vk.supported_extensions.ANDROID_external_memory_android_hardware_buffer;
++#endif
+       /* Wayland compositors in a PRoot render on the CPU and offer no dma-buf: wl_shm copies. */
+       pdev->wsi_device.wl_sw_fallback = true;
+    }
+diff --git a/src/util/meson.build b/src/util/meson.build
+index 0c21690..b51825c 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -12,7 +12,11 @@ endif
+ 
+ subdir('blake3')
+ 
+-files_mesa_util = files(
++files_mesa_util = []
++if with_xclipse_ahb
++  files_mesa_util += files('xclipse_ahb.c')
++endif
++files_mesa_util += files(
+   'anon_file.h',
+   'anon_file.c',
+   'bigmath.h',
+@@ -578,3 +582,28 @@ if with_tests
+   subdir('tests/vma')
+   subdir('tests/format')
+ endif
++
++if with_xclipse_ahb and (with_tests or get_option('xclipse-ahb-tests'))
++  ahb_mock = shared_library('xclipse_ahb_mock', 'tests/xclipse_ahb_mock.c',
++    include_directories : inc_util, gnu_symbol_visibility : 'default', install : false)
++  ahb_incomplete_mock = shared_library('xclipse_ahb_incomplete_mock', 'tests/xclipse_ahb_mock.c',
++    c_args : ['-DNO_LAYOUT'], include_directories : inc_util,
++    gnu_symbol_visibility : 'default', install : false)
++  ahb_test = executable('xclipse_ahb_test', 'tests/xclipse_ahb_test.c',
++    include_directories : inc_util, dependencies : [idep_mesautil, dep_thread],
++    c_args : ['-UNDEBUG'])
++  test('xclipse-ahb-missing', ahb_test, args : ['unavailable'],
++    env : ['RADV_AHB_LIBRARY=/nonexistent/radv-ahb.so'], suite : ['xclipse-ahb'])
++  test('xclipse-ahb-incomplete', ahb_test, args : ['unavailable'],
++    env : ['RADV_AHB_LIBRARY=' + ahb_incomplete_mock.full_path()],
++    depends : ahb_incomplete_mock, suite : ['xclipse-ahb'])
++  test('xclipse-ahb-transport', ahb_test, args : ['transport'],
++    env : ['RADV_AHB_LIBRARY=' + ahb_mock.full_path()],
++    depends : ahb_mock, suite : ['xclipse-ahb'])
++  test('xclipse-ahb-transport-is-not-layout', ahb_test, args : ['bad-layout'],
++    env : ['RADV_AHB_LIBRARY=' + ahb_mock.full_path(), 'MOCK_AHB_TRANSPORT_LAYOUT=1'],
++    depends : ahb_mock, suite : ['xclipse-ahb'])
++  test('xclipse-ahb-bad-layout', ahb_test, args : ['bad-layout'],
++    env : ['RADV_AHB_LIBRARY=' + ahb_mock.full_path(), 'MOCK_AHB_BAD_LAYOUT=1'],
++    depends : ahb_mock, suite : ['xclipse-ahb'])
++endif
+diff --git a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
+index 12b9b8a..14f37b7 100644
+--- a/src/vulkan/runtime/meson.build
++++ b/src/vulkan/runtime/meson.build
+@@ -61,6 +61,10 @@ if dep_libdrm.found()
+   vulkan_lite_runtime_deps += dep_libdrm
+ endif
+ 
++if with_xclipse_ahb
++  vulkan_lite_runtime_files += files('vk_android_glibc.c')
++endif
++
+ if with_platform_android
+   vulkan_lite_runtime_files += files('vk_android.c')
+   vulkan_lite_runtime_deps += [dep_android, idep_u_gralloc]
+diff --git a/src/vulkan/runtime/vk_debug_utils.c b/src/vulkan/runtime/vk_debug_utils.c
+index f8bc92f..845a77d 100644
+--- a/src/vulkan/runtime/vk_debug_utils.c
++++ b/src/vulkan/runtime/vk_debug_utils.c
+@@ -323,7 +323,7 @@ vk_common_SetDebugUtilsObjectNameEXT(
+ {
+    VK_FROM_HANDLE(vk_device, device, _device);
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    if (pNameInfo->objectType == VK_OBJECT_TYPE_SWAPCHAIN_KHR ||
+        pNameInfo->objectType == VK_OBJECT_TYPE_SURFACE_KHR) {
+ #else
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 6955ba3..9836b74 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -249,7 +249,7 @@ vk_device_init(struct vk_device *device,
+       UNREACHABLE("Invalid timeline mode");
+    }
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    mtx_init(&device->swapchain_private_mtx, mtx_plain);
+    device->swapchain_private = NULL;
+ #endif /* VK_USE_PLATFORM_ANDROID_KHR */
+@@ -330,7 +330,7 @@ vk_device_finish(struct vk_device *device)
+    vk_device_memory_report_finish(device);
+    vk_memory_trace_finish(device);
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    if (device->swapchain_private) {
+       hash_table_foreach(device->swapchain_private, entry)
+          util_sparse_array_finish(entry->data);
+diff --git a/src/vulkan/runtime/vk_device_memory.c b/src/vulkan/runtime/vk_device_memory.c
+index 83cc917..4cfc18b 100644
+--- a/src/vulkan/runtime/vk_device_memory.c
++++ b/src/vulkan/runtime/vk_device_memory.c
+@@ -28,8 +28,12 @@
+ #include "vk_util.h"
+ 
+ #if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26
++#ifdef HAVE_XCLIPSE_AHB
++#include "util/xclipse_ahb.h"
++#else
+ #include <vndk/hardware_buffer.h>
+ #endif
++#endif
+ 
+ void *
+ vk_device_memory_create(struct vk_device *device,
+diff --git a/src/vulkan/runtime/vk_image.c b/src/vulkan/runtime/vk_image.c
+index a8bbadd..3154db6 100644
+--- a/src/vulkan/runtime/vk_image.c
++++ b/src/vulkan/runtime/vk_image.c
+@@ -120,6 +120,7 @@ vk_image_init(struct vk_device *device,
+              VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)
+       image->android_buffer_type = ANDROID_BUFFER_HARDWARE;
+ 
++#if DETECT_OS_ANDROID
+    const VkNativeBufferANDROID *native_buffer =
+       vk_find_struct_const(pCreateInfo->pNext, NATIVE_BUFFER_ANDROID);
+ 
+@@ -135,6 +136,7 @@ vk_image_init(struct vk_device *device,
+       image->android_buffer_type = ANDROID_BUFFER_NATIVE_ALIAS;
+    }
+ 
++#endif
+    const VkFormat external_format =
+       vk_android_get_external_format(pCreateInfo->pNext);
+    if (external_format != VK_FORMAT_UNDEFINED) {
+diff --git a/src/vulkan/runtime/vk_image.h b/src/vulkan/runtime/vk_image.h
+index 4518281..4cf3963 100644
+--- a/src/vulkan/runtime/vk_image.h
++++ b/src/vulkan/runtime/vk_image.h
+@@ -451,7 +451,7 @@ VkImageLayout vk_att_ref_stencil_layout(const VkAttachmentReference2 *att_ref,
+ VkImageLayout vk_att_desc_stencil_layout(const VkAttachmentDescription2 *att_desc,
+                                            bool final);
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+ static inline bool
+ vk_image_is_android_native_buffer(struct vk_image *image)
+ {
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 78439db..d353845 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -1238,7 +1238,7 @@ vk_queue_finish(struct vk_queue *queue)
+       vk_queue_submit_destroy(queue, submit);
+    }
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    if (queue->anb_semaphore != VK_NULL_HANDLE) {
+       struct vk_device *device = queue->base.device;
+       device->dispatch_table.DestroySemaphore(vk_device_to_handle(device),
+diff --git a/src/vulkan/runtime/vk_queue.h b/src/vulkan/runtime/vk_queue.h
+index 82b8d14..d917438 100644
+--- a/src/vulkan/runtime/vk_queue.h
++++ b/src/vulkan/runtime/vk_queue.h
+@@ -146,7 +146,7 @@ struct vk_queue {
+    struct util_dynarray labels;
+    bool region_begin;
+ 
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    /** SYNC_FD signal semaphore for vkQueueSignalReleaseImageANDROID
+     *
+     * VK_ANDROID_native_buffer enforces explicit fencing on the present api
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index a7ec192..aefbb66 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -170,6 +170,8 @@ struct wsi_device {
+     * userspace may face either kind of X server (Xclipse in a Termux PRoot: Termux:X11 has DRI3,
+     * a VNC server does not). */
+    bool x11_sw_fallback;
++   /* Optional glibc AHB bridge. Only RADV on Xclipse sets this capability. */
++   bool x11_ahb;
+ 
+    /* Wayland only: a compositor without zwp_linux_dmabuf_v1 (one that renders on the CPU, as in a
+     * Termux PRoot) gets CPU-image swapchains copied into wl_shm buffers instead of no presentation
+@@ -334,7 +336,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+ static inline bool
+ wsi_common_is_swapchain_image(const VkImageCreateInfo *pCreateInfo)
+ {
+-#ifdef VK_USE_PLATFORM_ANDROID_KHR
++#if DETECT_OS_ANDROID
+    return false;
+ # else
+    const VkImageSwapchainCreateInfoKHR *swapchain_info =
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index cf2f130..3cdc7af 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -63,6 +63,11 @@
+ #include "vk_enum_to_str.h"
+ #include "wsi_common_entrypoints.h"
+ #include "wsi_common_private.h"
++#ifdef HAVE_XCLIPSE_AHB
++#include "util/xclipse_ahb.h"
++#include "vk_android.h"
++#include <sys/socket.h>
++#endif
+ #include "wsi_common_queue.h"
+ #include "loader/loader_dri_helper_screen.h"
+ 
+@@ -1260,6 +1265,7 @@ struct x11_present_timing_entry {
+ 
+ struct x11_swapchain {
+    struct wsi_swapchain                        base;
++   bool ahb;
+ 
+    bool                                         has_dri3_modifiers;
+    bool                                         has_mit_shm;
+@@ -2542,7 +2548,7 @@ x11_manage_present_queue(void *state)
+ 
+       /* Not necessary to block when we have explicit sync */
+       bool need_fence_wait =
+-            x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
++            (chain->ahb || x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode)) &&
+             !chain->base.image_info.explicit_sync;
+ 
+       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
+@@ -2633,6 +2639,123 @@ alloc_shm(struct wsi_image *imagew, unsigned size)
+ #endif
+ }
+ 
++#ifdef HAVE_XCLIPSE_AHB
++/* Allocate once in gralloc, then bind the same dma-buf for rendering and
++ * hand the AHB itself to Termux-X11. No staging buffer or per-frame copy. */
++static VkResult
++x11_create_ahb_mem(const struct wsi_swapchain *chain,
++                   const struct wsi_image_info *info, struct wsi_image *image)
++{
++   VK_FROM_HANDLE(vk_device, device, chain->device);
++   AHardwareBuffer_Desc desc = {
++      .width = info->create.extent.width,
++      .height = info->create.extent.height,
++      .layers = 1,
++      .format = vk_image_format_to_ahb_format(info->create.format),
++      .usage = vk_image_usage_to_ahb_usage(info->create.flags, info->create.usage),
++   };
++   AHardwareBuffer *ahb = NULL;
++   if (AHardwareBuffer_allocate(&desc, &ahb) || !ahb)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   uint64_t modifier, offset;
++   uint32_t pitch;
++   if (xclipse_ahb_layout(ahb, &modifier, &pitch, &offset) || offset > UINT32_MAX)
++      goto out;
++   VkAndroidHardwareBufferPropertiesANDROID props = {
++      .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
++   };
++   result = device->dispatch_table.GetAndroidHardwareBufferPropertiesANDROID(chain->device, ahb, &props);
++   if (result != VK_SUCCESS)
++      goto out;
++   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
++   if (!props.memoryTypeBits || !handle || handle->numFds < 1) {
++      result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++      goto out;
++   }
++   image->dma_buf_fd = os_dupfd_cloexec(handle->data[0]);
++   if (image->dma_buf_fd < 0) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto out;
++   }
++   struct wsi_memory_allocate_info memory_wsi_info = {
++      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
++      .implicit_sync = !info->explicit_sync && !chain->dma_buf_semaphore,
++      .dma_buf_sync_file = chain->dma_buf_semaphore,
++   };
++   VkImportAndroidHardwareBufferInfoANDROID import = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
++      .pNext = &memory_wsi_info,
++      .buffer = ahb,
++   };
++   VkExportMemoryAllocateInfo export = {
++      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++      .pNext = &import,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++   };
++   VkMemoryDedicatedAllocateInfo dedicated = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .pNext = &export,
++      .image = image->image,
++   };
++   VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &dedicated,
++      .allocationSize = 0, /* required for dedicated AHB image import */
++      .memoryTypeIndex = ffs(props.memoryTypeBits) - 1,
++   };
++   result = chain->wsi->AllocateMemory(chain->device, &alloc, &chain->alloc, &image->memory);
++   if (result == VK_SUCCESS) {
++      image->num_planes = 1;
++      image->row_pitches[0] = pitch;
++      image->offsets[0] = offset;
++      image->drm_modifier = modifier;
++   }
++out:
++   AHardwareBuffer_release(ahb);
++   return result;
++}
++
++static VkResult
++x11_ahb_pixmap_from_buffer(struct x11_swapchain *chain, struct x11_image *image,
++                            xcb_void_cookie_t *cookie)
++{
++   VK_FROM_HANDLE(vk_device, device, chain->base.device);
++   VkMemoryGetAndroidHardwareBufferInfoANDROID get = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
++      .memory = image->base.memory,
++   };
++   AHardwareBuffer *ahb = NULL;
++   VkResult result = device->dispatch_table.GetMemoryAndroidHardwareBufferANDROID(
++      chain->base.device, &get, &ahb);
++   if (result != VK_SUCCESS)
++      return result;
++   int sockets[2];
++   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) {
++      AHardwareBuffer_release(ahb);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   /* Termux-X11's private modifier is a transport tag, NOT a DRM layout
++    * modifier. Never pass it to Vulkan image layout or modifier queries.
++    * libxcb owns sockets[1] after this call. */
++   *cookie = xcb_dri3_pixmap_from_buffers_checked(chain->conn, image->pixmap,
++      chain->window, 1, chain->extent.width, chain->extent.height,
++      image->base.row_pitches[0], 0, 0, 0, 0, 0, 0, 0, chain->depth, 32,
++      1255 /* AHARDWAREBUFFER_SOCKET_FD */, &sockets[1]);
++   xcb_flush(chain->conn);
++   int ret = xclipse_ahb_send(ahb, sockets[0]);
++   close(sockets[0]);
++   AHardwareBuffer_release(ahb);
++   if (ret) {
++      /* Discard the checked reply without waiting on a stalled server.
++       * Closing the socket also terminates a server-side AHB receive. */
++      xcb_discard_reply(chain->conn, cookie->sequence);
++      return VK_ERROR_SURFACE_LOST_KHR;
++   }
++   return VK_SUCCESS;
++}
++#endif
++
+ static VkResult
+ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+                const VkSwapchainCreateInfoKHR *pCreateInfo,
+@@ -2677,6 +2800,14 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+       goto out_fence;
+    }
+    image->pixmap = xcb_generate_id(chain->conn);
++#ifdef HAVE_XCLIPSE_AHB
++   if (chain->ahb) {
++      result = x11_ahb_pixmap_from_buffer(chain, image, &cookie);
++      if (result != VK_SUCCESS)
++         goto fail_image;
++      goto check_pixmap;
++   }
++#endif
+ 
+    if (image->base.drm_modifier != DRM_FORMAT_MOD_INVALID) {
+       /* If the image has a modifier, we must have DRI3 v1.2. */
+@@ -2732,6 +2863,9 @@ x11_image_init(VkDevice device_h, struct x11_swapchain *chain,
+                                              chain->depth, bpp, fd);
+    }
+ 
++#ifdef HAVE_XCLIPSE_AHB
++check_pixmap:
++#endif
+    error = xcb_request_check(chain->conn, cookie);
+    if (error != NULL) {
+       free(error);
+@@ -2786,6 +2920,10 @@ fail_pixmap:
+    xcb_discard_reply(chain->conn, cookie.sequence);
+ 
+ fail_image:
++   if (image->update_region != None) {
++      cookie = xcb_xfixes_destroy_region(chain->conn, image->update_region);
++      xcb_discard_reply(chain->conn, cookie.sequence);
++   }
+    wsi_destroy_image(&chain->base, &image->base);
+ 
+ #else
+@@ -3258,6 +3396,17 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ #endif
+    }
+ 
++   bool use_ahb = false;
++#ifdef HAVE_XCLIPSE_AHB
++   use_ahb = !use_sw && !(WSI_DEBUG & WSI_DEBUG_BUFFER) && wsi_device->x11_ahb && wsi_conn->has_dri3_modifiers &&
++      debug_get_bool_option("RADV_TERMUX_X11_AHB", false) &&
++      (pCreateInfo->imageFormat == VK_FORMAT_B8G8R8A8_UNORM ||
++       pCreateInfo->imageFormat == VK_FORMAT_R8G8B8A8_UNORM);
++   if (use_ahb) {
++      drm_image_params.same_gpu = true;
++      drm_image_params.num_modifier_lists = 0;
++   }
++#endif
+    result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo,
+                                image_params, pAllocator);
+ 
+@@ -3267,6 +3416,15 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+    chain->base.sw = use_sw;
++   chain->ahb = use_ahb;
++#ifdef HAVE_XCLIPSE_AHB
++   if (use_ahb) {
++      chain->base.image_info.ext_mem.handleTypes =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
++      chain->base.image_info.create_mem = x11_create_ahb_mem;
++      chain->base.image_info.finish_create = NULL;
++   }
++#endif
+ 
+    chain->base.destroy = x11_swapchain_destroy;
+    chain->base.get_wsi_image = x11_get_wsi_image;
+diff --git a/docs/xclipse-ahb.md b/docs/xclipse-ahb.md
+new file mode 100644
+index 0000000..20967c7
+--- /dev/null
++++ b/docs/xclipse-ahb.md
+@@ -0,0 +1,99 @@
++# AHardwareBuffer on glibc and Termux-X11
++
++Build with `./build.sh` (or add `-Dxclipse-ahb=true` to a manual Meson configuration).
++For an existing build directory, enable the new feature once with
++`meson configure build-glibc -Dxclipse-ahb=true` before rebuilding.
++The bridge is optional at runtime. Without it, RADV retains the existing Linux
++DRI3/Wayland paths and does not advertise
++`VK_ANDROID_external_memory_android_hardware_buffer`.
++
++## Bridge contract
++
++Set `RADV_AHB_LIBRARY=/absolute/path/to/libradv_ahb.so`. The default library name
++is `libradv_ahb.so`. It must be **glibc-compatible**; Android's bionic
++`/system/lib64/libandroid.so` cannot be loaded directly into a glibc process.
++The library must implement the standard NDK ABI for:
++
++- `AHardwareBuffer_allocate`, `acquire`, `release`, `describe`
++- `AHardwareBuffer_getNativeHandle`
++- `AHardwareBuffer_isSupported`
++- `AHardwareBuffer_sendHandleToUnixSocket`
++
++It must also export:
++
++```c
++int radv_ahb_get_layout(const struct AHardwareBuffer *buffer,
++                       uint64_t *drm_modifier,
++                       uint32_t *byte_row_pitch,
++                       uint64_t *byte_offset);
++```
++
++Return zero only for a single-plane image whose memory is the first FD in the
++native handle. Return an error for layouts the bridge cannot describe accurately.
++`isSupported` must reflect allocations that this Vulkan layout contract supports.
++The socket sender must use the Android AHB serialization protocol, not a raw FD
++or a custom message format. All AHB entrypoints and objects must belong to the
++same bridge implementation. The bridge remains loaded while the driver runs.
++This repository supplies the client interface, not an Android allocator service
++or a libhybris implementation.
++
++RADV does not infer tiling from CPU usage or pixel stride. Unknown layouts fail
++import rather than silently rendering into an incompatible buffer. This initial
++interface excludes multi-plane YUV image layouts. BLOB memory can be imported
++and exported without an image layout.
++
++## Termux-X11 presentation
++
++With a compatible Termux-X11 server and the bridge available:
++
++```sh
++export RADV_AHB_LIBRARY=/path/to/libradv_ahb.so
++export RADV_TERMUX_X11_AHB=1
++export DISPLAY=:0
++vkcube
++```
++
++The opt-in applies to RGBA8/BGRA8 UNORM windows on a DRI3 1.2-capable connection.
++It allocates each swapchain buffer once through AHB, imports its dma-buf for
++RADV rendering, and sends the same AHB to the server with its private modifier
++`1255` (`AHARDWAREBUFFER_SOCKET_FD`). This value describes socket transport;
++it is never used as the Vulkan image's DRM layout modifier. The server's ready
++byte is consumed before sending the handle, and the X request is checked after
++sending, to avoid a request/receive deadlock. There is no PRIME blit or CPU
++pixel copy in this client path. The server can still composite the image; this
++is not a guarantee of direct scanout.
++
++The transport was checked against [Termux-X11 29d4460](https://github.com/termux/termux-x11/blob/29d4460b26e69b39af023d255a255e2778251952/lorie/src/main/cpp/lorie/InitOutput.c).
++The switch is explicit because that server advertises the ordinary
++linear modifier, rather than advertising the private AHB transport modifier.
++Do not enable it for an unrelated X server. `MESA_VK_WSI_DEBUG=sw` retains the
++CPU-copy path and takes precedence. Unsupported window formats also retain the
++ordinary path. A missing bridge retains the ordinary path; a failed AHB import
++or socket request reports an error instead of presenting uninitialized pixels.
++
++## Synchronization
++
++AHB handle transfer alone does not transfer a render-completion fence. With
++DRI3/Present explicit synchronization, WSI uses GPU timeline synchronization and
++omits the legacy render fence wait. On older servers, including the inspected
++Termux-X11 version, a render-completion wait remains on the presentation worker.
++Removing it without a server-side acquire-fence mechanism can race rendering
++and display. Acquire/release synchronization, swapchain recycling waits, and
++presentation timing waits remain necessary. No CPU-wait-free or frame-rate
++improvement is claimed without measurements on the phone.
++
++## Validation
++
++Enable `-Dxclipse-ahb-tests=true`, then run:
++
++```sh
++meson test -C build-glibc --suite xclipse-ahb --print-errorlogs
++```
++
++Mock-bridge tests cover missing/incomplete libraries, concurrent initialization,
++reference ownership and FD closure, padded row pitches, rejected layouts, and
++valid/invalid socket handshakes. They do not validate Android gralloc or GPU
++execution. On a phone, additionally check extension enumeration with `vulkaninfo`,
++run `vkcube` in FIFO/mailbox/immediate modes, resize windows, and test both
++`RADV_TERMUX_X11_AHB=0` and `1`. Compare frame times and verify buffer contents
++and acquire/release behavior before claiming a performance improvement.
+diff --git a/src/util/tests/xclipse_ahb_mock.c b/src/util/tests/xclipse_ahb_mock.c
+new file mode 100644
+index 0000000..4e92ff1
+--- /dev/null
++++ b/src/util/tests/xclipse_ahb_mock.c
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#define XCLIPSE_AHB_NO_ALIASES
++#include "util/xclipse_ahb.h"
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *, AHardwareBuffer **);
++void AHardwareBuffer_acquire(AHardwareBuffer *);
++void AHardwareBuffer_release(AHardwareBuffer *);
++void AHardwareBuffer_describe(const AHardwareBuffer *, AHardwareBuffer_Desc *);
++const native_handle_t *AHardwareBuffer_getNativeHandle(const AHardwareBuffer *);
++int AHardwareBuffer_isSupported(const AHardwareBuffer_Desc *);
++int AHardwareBuffer_sendHandleToUnixSocket(const AHardwareBuffer *, int);
++int radv_ahb_get_layout(const AHardwareBuffer *, uint64_t *, uint32_t *, uint64_t *);
++
++struct AHardwareBuffer {
++   AHardwareBuffer_Desc desc;
++   unsigned refs;
++   struct { int version, numFds, numInts, fd; } handle;
++};
++
++int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *desc, AHardwareBuffer **out)
++{
++   *out = calloc(1, sizeof(**out));
++   if (!*out) return -1;
++   (*out)->desc = *desc;
++   (*out)->desc.stride = desc->width + 16;
++   (*out)->refs = 1;
++   (*out)->handle.version = sizeof(native_handle_t);
++   (*out)->handle.numFds = 1;
++   (*out)->handle.fd = memfd_create("mock-ahb", MFD_CLOEXEC);
++   if ((*out)->handle.fd < 0 || ftruncate((*out)->handle.fd, (desc->width + 16) * desc->height * 4)) {
++      if ((*out)->handle.fd >= 0) close((*out)->handle.fd);
++      free(*out); *out = NULL; return -1;
++   }
++   return 0;
++}
++void AHardwareBuffer_acquire(AHardwareBuffer *b) { b->refs++; }
++void AHardwareBuffer_release(AHardwareBuffer *b)
++{
++   if (!--b->refs) { close(b->handle.fd); free(b); }
++}
++void AHardwareBuffer_describe(const AHardwareBuffer *b, AHardwareBuffer_Desc *desc) { *desc = b->desc; }
++const native_handle_t *AHardwareBuffer_getNativeHandle(const AHardwareBuffer *b)
++{ return (const native_handle_t *)&b->handle; }
++int AHardwareBuffer_isSupported(const AHardwareBuffer_Desc *desc)
++{ return desc->format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM; }
++int AHardwareBuffer_sendHandleToUnixSocket(const AHardwareBuffer *b, int fd)
++{
++   const char marker = 42;
++   return send(fd, &marker, 1, MSG_NOSIGNAL) == 1 ? 0 : -1;
++}
++#ifndef NO_LAYOUT
++int radv_ahb_get_layout(const AHardwareBuffer *b, uint64_t *modifier, uint32_t *pitch, uint64_t *offset)
++{
++   if (getenv("MOCK_AHB_BAD_LAYOUT")) return -1;
++   *modifier = getenv("MOCK_AHB_TRANSPORT_LAYOUT") ? 1255 : 0;
++   *pitch = b->desc.stride * 4; *offset = 0;
++   return 0;
++}
++#endif
+diff --git a/src/util/tests/xclipse_ahb_test.c b/src/util/tests/xclipse_ahb_test.c
+new file mode 100644
+index 0000000..7da6496
+--- /dev/null
++++ b/src/util/tests/xclipse_ahb_test.c
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: MIT */
++#include "util/xclipse_ahb.h"
++#include "c11/threads.h"
++#include <assert.h>
++#include <errno.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++static int available_thread(void *unused)
++{
++   return xclipse_ahb_available() ? 0 : 1;
++}
++
++struct peer { int fd; bool valid; };
++static int server(void *data)
++{
++   struct peer *p = data;
++   char ready = p->valid ? 1 : 0, marker = 0;
++   assert(send(p->fd, &ready, 1, MSG_NOSIGNAL) == 1);
++   if (p->valid) {
++      assert(recv(p->fd, &marker, 1, 0) == 1);
++      assert(marker == 42);
++   }
++   close(p->fd);
++   return 0;
++}
++
++int main(int argc, char **argv)
++{
++   assert(argc == 2);
++   if (!strcmp(argv[1], "unavailable")) {
++      assert(!xclipse_ahb_available());
++      AHardwareBuffer_Desc desc = {0};
++      AHardwareBuffer *b = NULL;
++      assert(AHardwareBuffer_allocate(&desc, &b) == -ENOSYS);
++      return 0;
++   }
++   thrd_t threads[16];
++   for (unsigned i = 0; i < 16; i++) assert(thrd_create(&threads[i], available_thread, NULL) == thrd_success);
++   for (unsigned i = 0; i < 16; i++) {
++      int ret = -1;
++      assert(thrd_join(threads[i], &ret) == thrd_success && ret == 0);
++   }
++   AHardwareBuffer_Desc desc = {.width = 64, .height = 32, .layers = 1,
++      .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM, .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT};
++   assert(AHardwareBuffer_isSupported(&desc));
++   AHardwareBuffer *b = NULL;
++   assert(AHardwareBuffer_allocate(&desc, &b) == 0 && b);
++   AHardwareBuffer_acquire(b);
++   AHardwareBuffer_release(b);
++   AHardwareBuffer_describe(b, &desc);
++   assert(desc.width == 64 && desc.stride == 80);
++   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(b);
++   int fd = handle->data[0];
++   assert(handle->numFds == 1 && fd >= 0);
++   uint64_t mod = UINT64_MAX, offset = UINT64_MAX;
++   uint32_t pitch = 0;
++   if (!strcmp(argv[1], "bad-layout")) {
++      assert(xclipse_ahb_layout(b, &mod, &pitch, &offset) != 0);
++   } else {
++      assert(xclipse_ahb_layout(b, &mod, &pitch, &offset) == 0);
++      assert(mod == 0 && pitch == 320 && offset == 0);
++      for (int valid = 0; valid < 2; valid++) {
++         int sockets[2];
++         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
++         struct peer peer = {.fd = sockets[1], .valid = valid};
++         thrd_t worker;
++         assert(thrd_create(&worker, server, &peer) == thrd_success);
++         assert(xclipse_ahb_send(b, sockets[0]) == (valid ? 0 : -EPROTO));
++         close(sockets[0]);
++         assert(thrd_join(worker, NULL) == thrd_success);
++      }
++   }
++   AHardwareBuffer_release(b);
++   errno = 0;
++   assert(close(fd) == -1 && errno == EBADF);
++   return 0;
++}
+diff --git a/src/util/xclipse_ahb.c b/src/util/xclipse_ahb.c
+new file mode 100644
+index 0000000..d92057c
+--- /dev/null
++++ b/src/util/xclipse_ahb.c
+@@ -0,0 +1,136 @@
++/* SPDX-License-Identifier: MIT */
++#include "xclipse_ahb.h"
++#include "c11/threads.h"
++#include "util/log.h"
++#include <dlfcn.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include "drm-uapi/drm_fourcc.h"
++
++static once_flag once = ONCE_FLAG_INIT;
++static bool available;
++static struct {
++   int (*allocate)(const AHardwareBuffer_Desc *desc, AHardwareBuffer **out);
++   void (*acquire)(AHardwareBuffer *buffer);
++   void (*release)(AHardwareBuffer *buffer);
++   void (*describe)(const AHardwareBuffer *buffer, AHardwareBuffer_Desc *out);
++   const native_handle_t * (*getNativeHandle)(const AHardwareBuffer *buffer);
++   int (*isSupported)(const AHardwareBuffer_Desc *desc);
++   int (*sendHandleToUnixSocket)(const AHardwareBuffer *buffer, int fd);
++   int (*layout)(const AHardwareBuffer *, uint64_t *, uint32_t *, uint64_t *);
++} api;
++
++static void
++load_bridge(void)
++{
++   const char *path = getenv("RADV_AHB_LIBRARY");
++   void *lib = dlopen(path && path[0] ? path : "libradv_ahb.so", RTLD_NOW | RTLD_LOCAL);
++   if (!lib) {
++      if (path && path[0])
++         mesa_logw("RADV: cannot load AHB bridge: %s", dlerror());
++      return;
++   }
++   api.allocate = dlsym(lib, "AHardwareBuffer_allocate");
++   api.acquire = dlsym(lib, "AHardwareBuffer_acquire");
++   api.release = dlsym(lib, "AHardwareBuffer_release");
++   api.describe = dlsym(lib, "AHardwareBuffer_describe");
++   api.getNativeHandle = dlsym(lib, "AHardwareBuffer_getNativeHandle");
++   api.isSupported = dlsym(lib, "AHardwareBuffer_isSupported");
++   api.sendHandleToUnixSocket = dlsym(lib, "AHardwareBuffer_sendHandleToUnixSocket");
++   api.layout = dlsym(lib, "radv_ahb_get_layout");
++   available = api.allocate && api.acquire && api.release && api.describe && api.getNativeHandle && api.isSupported && api.sendHandleToUnixSocket && api.layout;
++   if (!available) {
++      mesa_logw("RADV: AHB bridge lacks required NDK entrypoints or radv_ahb_get_layout");
++      dlclose(lib);
++   }
++   /* A successful bridge stays loaded for the lifetime of all AHB objects. */
++}
++
++bool
++xclipse_ahb_available(void)
++{
++   call_once(&once, load_bridge);
++   return available;
++}
++
++int
++xclipse_ahb_allocate(const AHardwareBuffer_Desc *desc, AHardwareBuffer **out)
++{
++   if (!xclipse_ahb_available()) { return -ENOSYS; }
++   return api.allocate(desc, out);
++}
++
++void
++xclipse_ahb_acquire(AHardwareBuffer *buffer)
++{
++   if (!xclipse_ahb_available()) { return; }
++   api.acquire(buffer);
++}
++
++void
++xclipse_ahb_release(AHardwareBuffer *buffer)
++{
++   if (!xclipse_ahb_available()) { return; }
++   api.release(buffer);
++}
++
++void
++xclipse_ahb_describe(const AHardwareBuffer *buffer, AHardwareBuffer_Desc *out)
++{
++   if (!xclipse_ahb_available()) { return; }
++   api.describe(buffer, out);
++}
++
++const native_handle_t *
++xclipse_ahb_getNativeHandle(const AHardwareBuffer *buffer)
++{
++   if (!xclipse_ahb_available()) { return NULL; }
++   return api.getNativeHandle(buffer);
++}
++
++int
++xclipse_ahb_isSupported(const AHardwareBuffer_Desc *desc)
++{
++   if (!xclipse_ahb_available()) { return 0; }
++   return api.isSupported(desc);
++}
++
++int
++xclipse_ahb_sendHandleToUnixSocket(const AHardwareBuffer *buffer, int fd)
++{
++   if (!xclipse_ahb_available()) { return -ENOSYS; }
++   return api.sendHandleToUnixSocket(buffer, fd);
++}
++
++int
++xclipse_ahb_layout(const AHardwareBuffer *buffer, uint64_t *mod, uint32_t *pitch, uint64_t *offset)
++{
++   if (!xclipse_ahb_available())
++      return -ENOSYS;
++   int ret = api.layout(buffer, mod, pitch, offset);
++   if (ret)
++      return ret;
++   const native_handle_t *handle = api.getNativeHandle(buffer);
++   if (!handle || handle->numFds < 1 || handle->numInts < 0 || handle->data[0] < 0 ||
++       *mod == DRM_FORMAT_MOD_INVALID || *mod == 1255 || *mod == 1256 || *mod == 1274 || !*pitch)
++      return -EINVAL;
++   return 0;
++}
++
++int
++xclipse_ahb_send(const AHardwareBuffer *buffer, int fd)
++{
++   struct pollfd pfd = {.fd = fd, .events = POLLIN};
++   int ret;
++   do { ret = poll(&pfd, 1, 5000); } while (ret < 0 && errno == EINTR);
++   if (ret <= 0)
++      return ret == 0 ? -ETIMEDOUT : -errno;
++   unsigned char ready;
++   do { ret = recv(fd, &ready, 1, MSG_DONTWAIT); } while (ret < 0 && errno == EINTR);
++   if (ret != 1 || ready != 1)
++      return -EPROTO;
++   return AHardwareBuffer_sendHandleToUnixSocket(buffer, fd);
++}
+diff --git a/src/util/xclipse_ahb.h b/src/util/xclipse_ahb.h
+new file mode 100644
+index 0000000..01f3834
+--- /dev/null
++++ b/src/util/xclipse_ahb.h
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2017 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef XCLIPSE_AHB_H
++#define XCLIPSE_AHB_H
++#include <stdbool.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* NDK ABI declarations. AHardwareBuffer objects are owned by the selected
++ * glibc-compatible bridge, never by a separately loaded bionic libandroid. */
++typedef struct AHardwareBuffer AHardwareBuffer;
++enum {
++   AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM = 5,
++   AHARDWAREBUFFER_FORMAT_Y8 = 0x20203859,
++   AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED = 0x22,
++   AHARDWAREBUFFER_USAGE_CAMERA_MASK = 6UL << 16,
++};
++typedef struct native_handle { int version, numFds, numInts; int data[0]; } native_handle_t;
++enum AHardwareBuffer_Format {
++    AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM           = 1,
++    AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM           = 2,
++    AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM             = 3,
++    AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM             = 4,
++    AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT       = 0x16,
++    AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM        = 0x2b,
++    AHARDWAREBUFFER_FORMAT_BLOB                     = 0x21,
++    AHARDWAREBUFFER_FORMAT_D16_UNORM                = 0x30,
++    AHARDWAREBUFFER_FORMAT_D24_UNORM                = 0x31,
++    AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT        = 0x32,
++    AHARDWAREBUFFER_FORMAT_D32_FLOAT                = 0x33,
++    AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT        = 0x34,
++    AHARDWAREBUFFER_FORMAT_S8_UINT                  = 0x35,
++    AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420             = 0x23,
++    AHARDWAREBUFFER_FORMAT_YCbCr_P010               = 0x36,
++    AHARDWAREBUFFER_FORMAT_YCbCr_P210               = 0x3c,
++    AHARDWAREBUFFER_FORMAT_R8_UNORM                 = 0x38,
++    AHARDWAREBUFFER_FORMAT_R16_UINT                 = 0x39,
++    AHARDWAREBUFFER_FORMAT_R16G16_UINT              = 0x3a,
++    AHARDWAREBUFFER_FORMAT_R10G10B10A10_UNORM       = 0x3b,
++};
++enum AHardwareBuffer_UsageFlags {
++    AHARDWAREBUFFER_USAGE_CPU_READ_NEVER        = 0UL,
++    AHARDWAREBUFFER_USAGE_CPU_READ_RARELY       = 2UL,
++    AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN        = 3UL,
++    AHARDWAREBUFFER_USAGE_CPU_READ_MASK         = 0xFUL,
++    AHARDWAREBUFFER_USAGE_CPU_WRITE_NEVER       = 0UL << 4,
++    AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY      = 2UL << 4,
++    AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN       = 3UL << 4,
++    AHARDWAREBUFFER_USAGE_CPU_WRITE_MASK        = 0xFUL << 4,
++    AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE     = 1UL << 8,
++    AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER       = 1UL << 9,
++    AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT      = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER,
++    AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY      = 1ULL << 11,
++    AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT     = 1UL << 14,
++    AHARDWAREBUFFER_USAGE_VIDEO_ENCODE          = 1UL << 16,
++    AHARDWAREBUFFER_USAGE_SENSOR_DIRECT_DATA    = 1UL << 23,
++    AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER       = 1UL << 24,
++    AHARDWAREBUFFER_USAGE_GPU_CUBE_MAP          = 1UL << 25,
++    AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE   = 1UL << 26,
++    AHARDWAREBUFFER_USAGE_FRONT_BUFFER = 1ULL << 32,
++    AHARDWAREBUFFER_USAGE_VENDOR_0  = 1ULL << 28,
++    AHARDWAREBUFFER_USAGE_VENDOR_1  = 1ULL << 29,
++    AHARDWAREBUFFER_USAGE_VENDOR_2  = 1ULL << 30,
++    AHARDWAREBUFFER_USAGE_VENDOR_3  = 1ULL << 31,
++    AHARDWAREBUFFER_USAGE_VENDOR_4  = 1ULL << 48,
++    AHARDWAREBUFFER_USAGE_VENDOR_5  = 1ULL << 49,
++    AHARDWAREBUFFER_USAGE_VENDOR_6  = 1ULL << 50,
++    AHARDWAREBUFFER_USAGE_VENDOR_7  = 1ULL << 51,
++    AHARDWAREBUFFER_USAGE_VENDOR_8  = 1ULL << 52,
++    AHARDWAREBUFFER_USAGE_VENDOR_9  = 1ULL << 53,
++    AHARDWAREBUFFER_USAGE_VENDOR_10 = 1ULL << 54,
++    AHARDWAREBUFFER_USAGE_VENDOR_11 = 1ULL << 55,
++    AHARDWAREBUFFER_USAGE_VENDOR_12 = 1ULL << 56,
++    AHARDWAREBUFFER_USAGE_VENDOR_13 = 1ULL << 57,
++    AHARDWAREBUFFER_USAGE_VENDOR_14 = 1ULL << 58,
++    AHARDWAREBUFFER_USAGE_VENDOR_15 = 1ULL << 59,
++    AHARDWAREBUFFER_USAGE_VENDOR_16 = 1ULL << 60,
++    AHARDWAREBUFFER_USAGE_VENDOR_17 = 1ULL << 61,
++    AHARDWAREBUFFER_USAGE_VENDOR_18 = 1ULL << 62,
++    AHARDWAREBUFFER_USAGE_VENDOR_19 = 1ULL << 63,
++};
++typedef struct AHardwareBuffer_Desc {
++    uint32_t width;  
++    uint32_t height; 
++    
++    uint32_t layers;
++    uint32_t format; 
++    uint64_t usage;  
++    uint32_t stride; 
++    uint32_t rfu0;   
++    uint64_t rfu1;   
++} AHardwareBuffer_Desc;
++int xclipse_ahb_allocate(const AHardwareBuffer_Desc *desc, AHardwareBuffer **out);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_allocate xclipse_ahb_allocate
++#endif
++void xclipse_ahb_acquire(AHardwareBuffer *buffer);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_acquire xclipse_ahb_acquire
++#endif
++void xclipse_ahb_release(AHardwareBuffer *buffer);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_release xclipse_ahb_release
++#endif
++void xclipse_ahb_describe(const AHardwareBuffer *buffer, AHardwareBuffer_Desc *out);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_describe xclipse_ahb_describe
++#endif
++const native_handle_t * xclipse_ahb_getNativeHandle(const AHardwareBuffer *buffer);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_getNativeHandle xclipse_ahb_getNativeHandle
++#endif
++int xclipse_ahb_isSupported(const AHardwareBuffer_Desc *desc);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_isSupported xclipse_ahb_isSupported
++#endif
++int xclipse_ahb_sendHandleToUnixSocket(const AHardwareBuffer *buffer, int fd);
++#ifndef XCLIPSE_AHB_NO_ALIASES
++#define AHardwareBuffer_sendHandleToUnixSocket xclipse_ahb_sendHandleToUnixSocket
++#endif
++
++bool xclipse_ahb_available(void);
++/* Required bridge export, in addition to the NDK AHB entrypoints:
++ * int radv_ahb_get_layout(const AHardwareBuffer *, uint64_t *modifier,
++ *                       uint32_t *byte_pitch, uint64_t *offset);
++ * Return 0 only for a single-plane buffer in native_handle->data[0].
++ * Never infer linear layout from CPU usage flags or descriptor stride.
++ */
++int xclipse_ahb_layout(const AHardwareBuffer *, uint64_t *, uint32_t *, uint64_t *);
++/* Termux-X11 modifier 1255 handshake: await its ready byte before sending. */
++int xclipse_ahb_send(const AHardwareBuffer *, int socket_fd);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/vulkan/runtime/vk_android_glibc.c b/src/vulkan/runtime/vk_android_glibc.c
+new file mode 100644
+index 0000000..0e5e999
+--- /dev/null
++++ b/src/vulkan/runtime/vk_android_glibc.c
+@@ -0,0 +1,746 @@
++/*
++ * Copyright © 2023 Collabora, Ltd.
++ * Copyright © 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ * AHB-only runtime for glibc. Android WSI/gralloc HAL entrypoints are intentionally
++ * not linked. Shared helpers below are derived from vk_android.c.
++ */
++#include "vk_android.h"
++#include "vk_common_entrypoints.h"
++#include "vk_alloc.h"
++#include "vk_device.h"
++#include "vk_image.h"
++#include "vk_format.h"
++#include "vk_format_info.h"
++#include "vk_physical_device.h"
++#include "vk_render_pass.h"
++#include "vk_util.h"
++#include "util/log.h"
++#include "util/xclipse_ahb.h"
++#include "drm-uapi/drm_fourcc.h"
++#include <inttypes.h>
++
++uint64_t vk_android_get_front_buffer_usage(void) { return 0; }
++
++VkResult
++vk_android_get_ahb_layout(struct AHardwareBuffer *ahb,
++                         VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
++                         VkSubresourceLayout *layouts, int max_planes)
++{
++   uint64_t modifier, offset;
++   uint32_t pitch;
++   if (max_planes < 1 || xclipse_ahb_layout(ahb, &modifier, &pitch, &offset))
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   layouts[0] = (VkSubresourceLayout){.offset = offset, .rowPitch = pitch};
++   *out = (VkImageDrmFormatModifierExplicitCreateInfoEXT){
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = modifier,
++      .drmFormatModifierPlaneCount = 1,
++      .pPlaneLayouts = layouts,
++   };
++   return VK_SUCCESS;
++}
++
++VkResult
++vk_android_init_deferred_image(struct vk_device *device,
++                               struct vk_image *image,
++                               const VkImageCreateInfo *pCreateInfo,
++                               const VkAllocationCallbacks *pAllocator)
++{
++   /* collect all dynamic array infos */
++   uint32_t queue_family_count = 0;
++   uint32_t view_format_count = 0;
++   uint32_t fixed_rate_count = 0;
++
++   if (pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT)
++      queue_family_count = pCreateInfo->queueFamilyIndexCount;
++
++   const VkImageFormatListCreateInfo *raw_list =
++      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
++   if (raw_list)
++      view_format_count = raw_list->viewFormatCount;
++
++   const VkImageCompressionControlEXT *raw_compress =
++      vk_find_struct_const(pCreateInfo->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
++   if (raw_compress &&
++       (raw_compress->flags & VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT))
++      fixed_rate_count = raw_compress->compressionControlPlaneCount;
++
++   /* Extend below when drivers support more extensions that interact with ANB
++    * or AHB.
++    */
++   VK_MULTIALLOC(ma);
++   VK_MULTIALLOC_DECL(&ma, VkImageCreateInfo, create_info, 1);
++   VK_MULTIALLOC_DECL(&ma, VkImageFormatListCreateInfo, list_info, 1);
++   VK_MULTIALLOC_DECL(&ma, VkImageStencilUsageCreateInfo, stencil_info, 1);
++   VK_MULTIALLOC_DECL(&ma, VkImageCompressionControlEXT, compress_info, 1);
++   VK_MULTIALLOC_DECL(&ma, uint32_t, queue_families, queue_family_count);
++   VK_MULTIALLOC_DECL(&ma, VkFormat, view_formats, view_format_count);
++   VK_MULTIALLOC_DECL(&ma, VkImageCompressionFixedRateFlagsEXT, fixed_rates,
++                      fixed_rate_count);
++
++   if (!vk_multialloc_zalloc2(&ma, &device->alloc, pAllocator,
++                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT))
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   /* prepare the deferred VkImageCreateInfo chain */
++   *create_info = *pCreateInfo;
++   create_info->pNext = NULL;
++   /* Assign resolved AHB external format */
++   create_info->format = image->format;
++   create_info->tiling = image->tiling =
++      VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++   if (pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT) {
++      typed_memcpy(queue_families, pCreateInfo->pQueueFamilyIndices,
++                   pCreateInfo->queueFamilyIndexCount);
++      create_info->pQueueFamilyIndices = queue_families;
++   }
++
++   /* Per spec section 12.3. Images
++    *
++    * - If tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and flags contains
++    *   VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, then the pNext chain must include a
++    *   VkImageFormatListCreateInfo structure with non-zero viewFormatCount.
++    *
++    * ANB and aliased ANB always chain proper format list for mutable swapchain
++    * image support, but AHB is allowed to mutate without an explicit format
++    * list due to legacy spec issue. So we chain a view format of the create
++    * format itself to satisfy VK_EXT_image_drm_format_modifier VUs.
++    */
++   if (view_format_count ||
++       image->create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
++      if (view_format_count) {
++         typed_memcpy(view_formats, raw_list->pViewFormats, view_format_count);
++      } else {
++         view_format_count = 1;
++         view_formats = &create_info->format;
++      }
++      *list_info = (VkImageFormatListCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
++         .viewFormatCount = view_format_count,
++         .pViewFormats = view_formats,
++      };
++      __vk_append_struct(create_info, list_info);
++   }
++
++   if (image->stencil_usage) {
++      *stencil_info = (VkImageStencilUsageCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO,
++         .stencilUsage = image->stencil_usage,
++      };
++      __vk_append_struct(create_info, stencil_info);
++   }
++
++   /* VK_EXT_image_compression_control */
++   if (raw_compress) {
++      if (fixed_rate_count) {
++         typed_memcpy(fixed_rates, raw_compress->pFixedRateFlags,
++                      fixed_rate_count);
++      }
++      *compress_info = (VkImageCompressionControlEXT){
++         .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
++         .flags = raw_compress->flags,
++         .compressionControlPlaneCount = fixed_rate_count,
++         .pFixedRateFlags = fixed_rate_count ? fixed_rates : NULL,
++      };
++      __vk_append_struct(create_info, compress_info);
++   }
++
++   image->android_deferred_create_info = create_info;
++
++   return VK_SUCCESS;
++}
++
++
++static bool
++vk_android_gralloc_linear(void)
++{
++   return true;
++}
++
++VkFormat
++vk_ahb_format_to_image_format(uint32_t ahb_format)
++{
++   switch (ahb_format) {
++   case AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:
++   case AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM:
++      return VK_FORMAT_R8G8B8A8_UNORM;
++   case AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM:
++      return VK_FORMAT_R8G8B8_UNORM;
++   case AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM:
++      return VK_FORMAT_R5G6B5_UNORM_PACK16;
++   case AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT:
++      return VK_FORMAT_R16G16B16A16_SFLOAT;
++   case AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM:
++      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++   case AHARDWAREBUFFER_FORMAT_D16_UNORM:
++      return VK_FORMAT_D16_UNORM;
++   case AHARDWAREBUFFER_FORMAT_D24_UNORM:
++      return VK_FORMAT_X8_D24_UNORM_PACK32;
++   case AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT:
++      return VK_FORMAT_D24_UNORM_S8_UINT;
++   case AHARDWAREBUFFER_FORMAT_D32_FLOAT:
++      return VK_FORMAT_D32_SFLOAT;
++   case AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT:
++      return VK_FORMAT_D32_SFLOAT_S8_UINT;
++   case AHARDWAREBUFFER_FORMAT_S8_UINT:
++      return VK_FORMAT_S8_UINT;
++#if ANDROID_API_LEVEL >= 33
++   case AHARDWAREBUFFER_FORMAT_R8_UNORM:
++      return VK_FORMAT_R8_UNORM;
++#endif
++   case AHARDWAREBUFFER_FORMAT_Y8:
++      return VK_FORMAT_R8_UNORM;
++#if ANDROID_API_LEVEL >= 34
++   case AHARDWAREBUFFER_FORMAT_R16_UINT:
++      return VK_FORMAT_R16_UINT;
++   case AHARDWAREBUFFER_FORMAT_R16G16_UINT:
++      return VK_FORMAT_R16G16_UINT;
++#endif
++   case AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM:
++      return VK_FORMAT_B8G8R8A8_UNORM;
++   default:
++      return VK_FORMAT_UNDEFINED;
++   }
++}
++
++/* Convert a VkFormat to an AHB format, based on the "AHardwareBuffer Format
++ * Equivalence" table in Vulkan spec.
++ *
++ * Note that this only covers a subset of AHB formats defined in NDK.  Drivers
++ * can support more AHB formats, including private ones.
++ */
++uint32_t
++vk_image_format_to_ahb_format(VkFormat vk_format)
++{
++   switch (vk_format) {
++   case VK_FORMAT_R8G8B8A8_UNORM:
++      return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
++   case VK_FORMAT_R8G8B8_UNORM:
++      return AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM;
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++      return AHARDWAREBUFFER_FORMAT_R5G6B5_UNORM;
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++      return AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT;
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++      return AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
++   case VK_FORMAT_D16_UNORM:
++      return AHARDWAREBUFFER_FORMAT_D16_UNORM;
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++      return AHARDWAREBUFFER_FORMAT_D24_UNORM;
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++      return AHARDWAREBUFFER_FORMAT_D24_UNORM_S8_UINT;
++   case VK_FORMAT_D32_SFLOAT:
++      return AHARDWAREBUFFER_FORMAT_D32_FLOAT;
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return AHARDWAREBUFFER_FORMAT_D32_FLOAT_S8_UINT;
++   case VK_FORMAT_S8_UINT:
++      return AHARDWAREBUFFER_FORMAT_S8_UINT;
++#if ANDROID_API_LEVEL >= 33
++   case VK_FORMAT_R8_UNORM:
++      return AHARDWAREBUFFER_FORMAT_R8_UNORM;
++#endif
++#if ANDROID_API_LEVEL >= 34
++   case VK_FORMAT_R16_UINT:
++      return AHARDWAREBUFFER_FORMAT_R16_UINT;
++   case VK_FORMAT_R16G16_UINT:
++      return AHARDWAREBUFFER_FORMAT_R16G16_UINT;
++#endif
++   case VK_FORMAT_B8G8R8A8_UNORM:
++      return AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
++   default:
++      return 0;
++   }
++}
++
++VkFormat
++vk_external_format_to_efr_format(VkFormat external_format)
++{
++   /* passthrough for RGB formats */
++   if (!vk_format_get_ycbcr_info(external_format))
++      return external_format;
++
++   switch (external_format) {
++   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
++   case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
++      return VK_FORMAT_R8G8B8A8_UNORM;
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
++      return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++   default:
++      break;
++   }
++
++   /* no support beyond the potentially required YUV formats */
++   return VK_FORMAT_UNDEFINED;
++}
++
++/* Construct ahw usage mask from image usage bits, see
++ * 'AHardwareBuffer Usage Equivalence' in Vulkan spec.
++ */
++uint64_t
++vk_image_usage_to_ahb_usage(const VkImageCreateFlags2KHR vk_create,
++                            const VkImageUsageFlags2KHR vk_usage)
++{
++   uint64_t ahb_usage = 0;
++   if (vk_usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
++                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
++      ahb_usage |= AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
++
++   if (vk_usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
++      ahb_usage |= AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER;
++
++   if (vk_usage & VK_IMAGE_USAGE_STORAGE_BIT)
++      ahb_usage |= AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
++
++   if (vk_create & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
++      ahb_usage |= AHARDWAREBUFFER_USAGE_GPU_CUBE_MAP;
++
++   if (vk_create & VK_IMAGE_CREATE_PROTECTED_BIT)
++      ahb_usage |= AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT;
++
++   /* No usage bits set - set at least one GPU usage. */
++   if (ahb_usage == 0)
++      ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
++
++   /* Linear on Samsung gralloc, see vk_android_gralloc_linear(). */
++   if (vk_android_gralloc_linear() && !(vk_create & VK_IMAGE_CREATE_PROTECTED_BIT))
++      ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
++
++   return ahb_usage;
++}
++
++static uint64_t
++vk_image_info_to_ahb_usage(VkFormat vk_format,
++                           VkImageCreateFlags2KHR vk_create,
++                           VkImageUsageFlags2KHR vk_usage,
++                           const void *image_info_pnext)
++{
++   uint64_t ahb_usage = vk_image_usage_to_ahb_usage(vk_create, vk_usage);
++   bool force_linear = false;
++
++   /* Optimal tiling can be assumed for mutability only between unorm and srgb
++    * variants. For anything beyond that, force AHB alloc with linear tiling.
++    * This should cover most practical usages without perf impact. Ideally, a
++    * new gralloc query is needed to precisely instruct the allocation, but the
++    * shape could vary a lot across different vendors.
++    *
++    * To be noted: Android 16 and 17 have missed to forward the app provided
++    * image format list to AHB usage query for VK_KHR_swapchain_mutable_format
++    * support in the platform loader. The lucky part is the exact list does get
++    * forwarded to the actual ANB image creation. So we additionally workaround
++    * to assume optimal tiling when there's no format list provided.
++    */
++   if (vk_create & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
++      const VkImageFormatListCreateInfo *format_list =
++         vk_find_struct_const(image_info_pnext, IMAGE_FORMAT_LIST_CREATE_INFO);
++      if (format_list && format_list->viewFormatCount > 1) {
++         /* vk_format_srgb_to_linear returns the original format if not srgb */
++         const VkFormat src_fmt =
++            vk_format_srgb_to_linear(format_list->pViewFormats[0]);
++
++         for (uint32_t i = 1; i < format_list->viewFormatCount; i++) {
++            const VkFormat dst_fmt =
++               vk_format_srgb_to_linear(format_list->pViewFormats[i]);
++            if (src_fmt != dst_fmt) {
++               force_linear = true;
++               break;
++            }
++         }
++      }
++   }
++
++   /* VK_IMAGE_COMPRESSION_DISABLED_EXT means the app doesn't want an
++    * implicit compressed/tiled layout for this image. Use
++    * CPU_WRITE_RARELY to implicitly force LINEAR, preventing gralloc from
++    * allocating a compressed buffer and silently violating
++    * VK_IMAGE_COMPRESSION_DISABLED_EXT.
++    */
++   const VkImageCompressionControlEXT *compression_control =
++      vk_find_struct_const(image_info_pnext, IMAGE_COMPRESSION_CONTROL_EXT);
++   if (compression_control &&
++       (compression_control->flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
++       !vk_format_is_depth_or_stencil(vk_format))
++      force_linear = true;
++
++   if (force_linear)
++      ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
++
++   return ahb_usage;
++}
++
++static inline uint64_t
++vk_image_format_info_to_ahb_usage(const VkPhysicalDeviceImageFormatInfo2 *info)
++{
++
++   const VkImageCreateFlags2KHR flags = vk_image_format_info_2_flags(info);
++   const VkImageUsageFlags2KHR usage = vk_image_format_info_2_usage(info);
++   return vk_image_info_to_ahb_usage(info->format, flags, usage, info->pNext);
++}
++
++static inline uint64_t
++vk_image_create_info_to_ahb_usage(const VkImageCreateInfo *info)
++{
++   const VkImageCreateFlags2KHR flags = vk_image_create_flags(info);
++   const VkImageUsageFlags2KHR usage = vk_image_usage_flags(info);
++   return vk_image_info_to_ahb_usage(info->format, flags, usage, info->pNext);
++}
++
++static bool
++vk_ahb_probe_format(uint32_t ahb_format, uint64_t ahb_usage)
++{
++   AHardwareBuffer_Desc desc = {
++      .width = 16,
++      .height = 16,
++      .layers = 1,
++      .format = ahb_format,
++      .usage = ahb_usage,
++   };
++#if ANDROID_API_LEVEL >= 29
++   return AHardwareBuffer_isSupported(&desc);
++#else
++   AHardwareBuffer *ahb = NULL;
++   int ret = 0;
++
++   ret = AHardwareBuffer_allocate(&desc, &ahb);
++   if (ret)
++      return false;
++
++   AHardwareBuffer_release(ahb);
++
++   return true;
++#endif
++}
++
++struct AHardwareBuffer *
++vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
++{
++   const VkMemoryDedicatedAllocateInfo *dedicated_info =
++      vk_find_struct_const(pAllocateInfo->pNext,
++                           MEMORY_DEDICATED_ALLOCATE_INFO);
++
++   uint32_t w = 0;
++   uint32_t h = 1;
++   uint32_t layers = 1;
++   uint32_t format = 0;
++   uint64_t usage = 0;
++
++   /* If caller passed dedicated information. */
++   if (dedicated_info && dedicated_info->image) {
++      VK_FROM_HANDLE(vk_image, image, dedicated_info->image);
++
++      if (!image->ahb_format) {
++         mesa_loge("image->ahb_format must not be UNDEFINED");
++         return NULL;
++      }
++
++      w = image->extent.width;
++      h = image->extent.height;
++      layers = image->array_layers;
++      format = image->ahb_format;
++
++      /* Populate more accurate AHB usage via vk_image_create_info_to_ahb_usage
++       * if vk_android_init_deferred_image has been adopted. Otherwise, fallback
++       * to vk_image_usage_to_ahb_usage.
++       */
++      if (image->android_deferred_create_info) {
++         usage = vk_image_create_info_to_ahb_usage(
++            image->android_deferred_create_info);
++      } else {
++         usage = vk_image_usage_to_ahb_usage(image->create_flags, image->usage);
++         if ((image->compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
++             !vk_format_is_depth_or_stencil(image->format))
++            usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
++      }
++      /* The driver may need extra gralloc usage bits for its own layouts (PanVK, Mali). */
++      usage |= image->base.device->physical->android_ahb_image_usage;
++   } else {
++      /* AHB export allocation for VkBuffer requires a valid allocationSize */
++      assert(pAllocateInfo->allocationSize);
++      if (pAllocateInfo->allocationSize > UINT32_MAX)
++         return NULL;
++      w = pAllocateInfo->allocationSize;
++      format = AHARDWAREBUFFER_FORMAT_BLOB;
++      usage = AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER |
++              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
++              AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
++   }
++
++   struct AHardwareBuffer_Desc desc = {
++      .width = w,
++      .height = h,
++      .layers = layers,
++      .format = format,
++      .usage = usage,
++    };
++
++   struct AHardwareBuffer *ahb;
++   if (AHardwareBuffer_allocate(&desc, &ahb) != 0) {
++      mesa_loge("Failed to allocate AHB (w=%u,h=%u,l=%u,f=%u,u=0x%" PRIx64 ")",
++                w, h, layers, format, usage);
++      return NULL;
++   }
++
++   return ahb;
++}
++
++VkResult
++vk_android_get_ahb_image_properties(
++   VkPhysicalDevice pdev_handle,
++   const VkPhysicalDeviceImageFormatInfo2 *info,
++   VkImageFormatProperties2 *props)
++{
++   VK_FROM_HANDLE(vk_physical_device, pdevice, pdev_handle);
++   VkExternalImageFormatProperties *external_props;
++   VkAndroidHardwareBufferUsageANDROID *ahb_usage_props;
++
++   ASSERTED const VkPhysicalDeviceExternalImageFormatInfo *external_info =
++      vk_find_struct_const(info->pNext,
++                           PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
++   assert(
++      external_info &&
++      external_info->handleType ==
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
++
++   if (info->type != VK_IMAGE_TYPE_2D) {
++      return vk_errorf(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                       "type (%u) unsupported for AHB", info->type);
++   }
++
++   const uint32_t ahb_format = vk_image_format_to_ahb_format(info->format);
++   if (!ahb_format) {
++      return vk_errorf(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                       "format (%u) unsupported for AHB", info->format);
++   }
++
++   const uint64_t ahb_usage =
++      vk_image_format_info_to_ahb_usage(info) | pdevice->android_ahb_image_usage;
++   if (!vk_ahb_probe_format(ahb_format, ahb_usage)) {
++      return vk_errorf(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                       "ahb_format (%u) ahb_usage (0x%" PRIx64 ") unsupported",
++                       ahb_format, ahb_usage);
++   }
++
++   external_props =
++      vk_find_struct(props->pNext, EXTERNAL_IMAGE_FORMAT_PROPERTIES);
++   if (external_props) {
++      external_props->externalMemoryProperties = (VkExternalMemoryProperties){
++         .externalMemoryFeatures =
++            VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
++            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
++            VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++         .exportFromImportedHandleTypes =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++         .compatibleHandleTypes =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++      };
++   }
++
++   ahb_usage_props =
++      vk_find_struct(props->pNext, ANDROID_HARDWARE_BUFFER_USAGE_ANDROID);
++   if (ahb_usage_props)
++      ahb_usage_props->androidHardwareBufferUsage = ahb_usage;
++
++   return VK_SUCCESS;
++}
++
++void
++vk_android_get_ahb_buffer_properties(
++   VkPhysicalDevice pdev_handle,
++   const VkPhysicalDeviceExternalBufferInfo *info,
++   VkExternalBufferProperties *props)
++{
++   assert(info->handleType ==
++          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
++   props->externalMemoryProperties = (VkExternalMemoryProperties){
++      .externalMemoryFeatures =
++         VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
++         VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++      .exportFromImportedHandleTypes =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++      .compatibleHandleTypes =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
++   };
++}
++
++bool
++vk_android_rp_attachment_has_external_format(
++   const VkAttachmentDescription2 *desc)
++{
++   return desc->format == VK_FORMAT_UNDEFINED &&
++          vk_android_get_external_format(desc->pNext) != VK_FORMAT_UNDEFINED;
++}
++
++VkFormat
++vk_android_get_external_format(const void *pnext)
++{
++   const VkExternalFormatANDROID *info =
++      vk_find_struct_const(pnext, EXTERNAL_FORMAT_ANDROID);
++   return info ? (VkFormat)info->externalFormat : VK_FORMAT_UNDEFINED;
++}
++
++static bool
++subpass_uses_efr(const VkRenderPassCreateInfo2 *info, uint32_t s)
++{
++   const VkSubpassDescription2 *subpass = &info->pSubpasses[s];
++   if (!subpass->pResolveAttachments || subpass->colorAttachmentCount != 1)
++      return false;
++
++   const VkAttachmentReference2 *resolve_ref =
++      &subpass->pResolveAttachments[0];
++   return resolve_ref->attachment != VK_ATTACHMENT_UNUSED &&
++          vk_android_rp_attachment_has_external_format(
++             &info->pAttachments[resolve_ref->attachment]);
++}
++
++bool
++vk_android_is_efr_rp(struct vk_device *device,
++                     const VkRenderPassCreateInfo2 *info)
++{
++   const struct vk_properties *props = &device->physical->properties;
++   if (props->nullColorAttachmentWithExternalFormatResolve != VK_TRUE)
++      return false;
++
++   for (uint32_t s = 0; s < info->subpassCount; s++) {
++      if (subpass_uses_efr(info, s))
++         return true;
++   }
++
++   return false;
++}
++
++VkResult
++vk_android_create_efr_rp(struct vk_device *device,
++                         const VkRenderPassCreateInfo2 *info,
++                         const VkAllocationCallbacks *alloc,
++                         VkRenderPass *out_rp_handle)
++{
++   uint32_t efr_subpass_count = 0;
++   for (uint32_t s = 0; s < info->subpassCount; s++) {
++      if (subpass_uses_efr(info, s))
++         efr_subpass_count++;
++   }
++
++   STACK_ARRAY(VkAttachmentDescription2, attachments, info->attachmentCount);
++   STACK_ARRAY(VkSubpassDescription2, subpasses, info->subpassCount);
++   STACK_ARRAY(VkAttachmentReference2, color_refs, efr_subpass_count);
++
++   VkRenderPassCreateInfo2 local_info = *info;
++   local_info.pAttachments = attachments;
++   local_info.pSubpasses = subpasses;
++
++   typed_memcpy(attachments, info->pAttachments, info->attachmentCount);
++   for (uint32_t a = 0; a < info->attachmentCount; a++) {
++      VkAttachmentDescription2 *att = &attachments[a];
++      if (vk_android_rp_attachment_has_external_format(att)) {
++         VkFormat external_format = vk_android_get_external_format(att->pNext);
++         att->format = vk_external_format_to_efr_format(external_format);
++      }
++   }
++
++   VkAttachmentReference2 *color_ref_ptr = color_refs;
++
++   typed_memcpy(subpasses, info->pSubpasses, info->subpassCount);
++   for (uint32_t s = 0; s < info->subpassCount; s++) {
++      if (!subpass_uses_efr(info, s))
++         continue;
++
++      VkSubpassDescription2 *subpass = &subpasses[s];
++      assert(subpass->colorAttachmentCount == 1);
++      assert(subpass->pResolveAttachments);
++
++      *color_ref_ptr = subpass->pResolveAttachments[0];
++      subpass->pColorAttachments = color_ref_ptr++;
++      subpass->pResolveAttachments = NULL;
++   }
++
++   VkResult result = device->dispatch_table.CreateRenderPass2(
++      vk_device_to_handle(device), &local_info, alloc, out_rp_handle);
++
++   STACK_ARRAY_FINISH(attachments);
++   STACK_ARRAY_FINISH(subpasses);
++   STACK_ARRAY_FINISH(color_refs);
++
++   return result;
++}
++
++bool
++vk_android_is_efr_rendering_info(const VkRenderingInfo *info)
++{
++   /* implies nullColorAttachmentWithExternalFormatResolve == VK_TRUE */
++   assert(info);
++   return info->colorAttachmentCount == 1 &&
++          info->pColorAttachments[0].imageView == VK_NULL_HANDLE &&
++          info->pColorAttachments[0].resolveMode ==
++             VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID;
++}
++
++const VkRenderingInfo *
++vk_android_get_efr_rendering_info(const VkRenderingInfo *info,
++                                  VkRenderingInfo *local_info,
++                                  VkRenderingAttachmentInfo *local_color_att)
++{
++   *local_color_att = info->pColorAttachments[0];
++   local_color_att->imageView = local_color_att->resolveImageView;
++   local_color_att->imageLayout = local_color_att->resolveImageLayout;
++   local_color_att->resolveImageView = VK_NULL_HANDLE;
++   local_color_att->resolveMode = VK_RESOLVE_MODE_NONE;
++
++   *local_info = *info;
++   local_info->pColorAttachments = local_color_att;
++   return local_info;
++}
++
++bool
++vk_android_is_efr_inheritance_rendering_info(
++   const VkCommandBufferInheritanceInfo *info,
++   const VkCommandBufferInheritanceRenderingInfo *r_info)
++{
++   /* implies nullColorAttachmentWithExternalFormatResolve == VK_TRUE */
++   assert(info && r_info);
++   return r_info->colorAttachmentCount == 1 &&
++          r_info->pColorAttachmentFormats[0] == VK_FORMAT_UNDEFINED &&
++          vk_android_get_external_format(info->pNext) != VK_FORMAT_UNDEFINED;
++}
++
++const VkCommandBufferInheritanceRenderingInfo *
++vk_android_get_efr_inheritance_rendering_info(
++   const VkCommandBufferInheritanceInfo *info,
++   const VkCommandBufferInheritanceRenderingInfo *r_info,
++   VkCommandBufferInheritanceRenderingInfo *local_info,
++   VkFormat *local_color_format)
++{
++   VkFormat external_format = vk_android_get_external_format(info->pNext);
++   *local_color_format = vk_external_format_to_efr_format(external_format);
++   *local_info = *r_info;
++   local_info->pColorAttachmentFormats = local_color_format;
++   return local_info;
++}
++
++bool
++vk_android_is_efr_pipeline_rendering_info(
++   const VkGraphicsPipelineCreateInfo *info,
++   const VkPipelineRenderingCreateInfo *r_info)
++{
++   /* implies nullColorAttachmentWithExternalFormatResolve == VK_TRUE */
++   assert(info && r_info);
++   return r_info->colorAttachmentCount == 1 &&
++          r_info->pColorAttachmentFormats[0] == VK_FORMAT_UNDEFINED &&
++          vk_android_get_external_format(info->pNext) != VK_FORMAT_UNDEFINED;
++}
++
++const VkPipelineRenderingCreateInfo *
++vk_android_get_efr_pipeline_rendering_info(
++   const VkGraphicsPipelineCreateInfo *info,
++   const VkPipelineRenderingCreateInfo *r_info,
++   VkPipelineRenderingCreateInfo *local_info,
++   VkFormat *local_color_format)
++{
++   VkFormat external_format = vk_android_get_external_format(info->pNext);
++   *local_color_format = vk_external_format_to_efr_format(external_format);
++
++   *local_info = *r_info;
++   local_info->pColorAttachmentFormats = local_color_format;
++   return local_info;
++}
++
