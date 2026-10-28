@@ -1,0 +1,18 @@
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index dbf65b2..af90e56 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -367,6 +367,13 @@ wsi_destroy_image_explicit_sync_drm(const struct wsi_swapchain *chain,
+ VkResult
+ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
+ {
++   /* CPU/SHM images have no dma-buf fd.  Device-wide dma-buf support
++    * does not make those images eligible for dma-buf fence imports.
++    * Their presentation path performs its own CPU completion wait.
++    */
++   if (chain->image_info.image_type != WSI_IMAGE_TYPE_DRM)
++      return VK_SUCCESS;
++
+    /* We don't need implicit sync if explicit sync is available through the
+     * window system protocol.
+     */
