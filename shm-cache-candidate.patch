@@ -1,0 +1,34 @@
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1245,7 +1245,10 @@
+ 	commit->present_id = present_id;
+ 	commit->desired_present_time = desired_present_time;
+ 
+-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
++	// CPU buffers are snapshots, not live DMA-BUF imports.
++    struct wlr_dmabuf_attributes memoDmabuf = {};
++    const bool canMemoize = wlr_buffer_get_dmabuf( buf, &memoDmabuf );
++    if ( gamescope::OwningRc<CVulkanTexture> pTexture = canMemoize ? s_BufferMemos.LookupVulkanTexture( buf ) : nullptr )
+ 	{
+ 		// Going from OwningRc -> Rc now.
+ 		commit->vulkanTex = pTexture;
+@@ -1262,7 +1265,8 @@
+ 	gamescope::OwningRc<CVulkanTexture> pOwnedTexture = vulkan_create_texture_from_wlr_buffer( buf, std::move( pBackendFb ) );
+ 	commit->vulkanTex = pOwnedTexture;
+ 
+-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
++	if ( canMemoize )
++        s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+ 
+ 	return commit;
+ }
+@@ -6426,7 +6430,8 @@
+ 			already_exists = true;
+ 	}
+ 
+-	if ( already_exists && !reslistentry.feedback && reslistentry.presentation_feedbacks.empty() )
++	struct wlr_dmabuf_attributes duplicateDmabuf = {};
++    if ( already_exists && wlr_buffer_get_dmabuf( buf, &duplicateDmabuf ) && !reslistentry.feedback && reslistentry.presentation_feedbacks.empty() )
+ 	{
+ 		wlserver_lock();
+ 		wlr_buffer_unlock( buf );
